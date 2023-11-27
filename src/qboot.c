@@ -23,6 +23,7 @@
 
 #include "shell.h"
 #include "crc32.h"
+#include "typedef.h"
 
 #ifdef QBOOT_USING_STATUS_LED
 #include <qled.h>
@@ -77,6 +78,15 @@
 #define QBOOT_ALGO2_VERIFY_CRC          1
 #define QBOOT_ALGO2_VERIFY_MASK         0x0F
 
+#define QBOOT_USE_FILE                 1
+
+#ifdef QBOOT_USE_FILE
+#include "unistd.h"
+#include "fcntl.h"
+#define UPDATE_BIN_FILE "/update/update.rbl"
+#define FACTORY_BIN_FILE "/update/factory.rbl"
+#endif
+
 typedef struct {
     u8  type[4];
     u16 algo;
@@ -122,7 +132,7 @@ static bool qbt_fw_info_read(const char *part_name, fw_info_t *fw_info, bool fro
     return(true);
 }
 
-static bool qbt_fw_info_write(const char *part_name, fw_info_t *fw_info, bool to_tail)
+static bool qbt_fw_info_write(const char *part_name, const fw_info_t *fw_info, bool to_tail)
 {
     fal_partition_t part = (fal_partition_t)fal_partition_find(part_name);
     u32 addr = to_tail ? (part->len - sizeof(fw_info_t)) : 0;
@@ -133,13 +143,13 @@ static bool qbt_fw_info_write(const char *part_name, fw_info_t *fw_info, bool to
     return(true);
 }
 
-static bool qbt_fw_info_check(fw_info_t *fw_info)
+static bool qbt_fw_info_check(const fw_info_t *fw_info)
 {
     if (strcmp((const char *)(fw_info->type), "RBL") != 0)
     {
         return(false);
     }
-    
+        
     return (crc32_cal((u8 *)fw_info, (sizeof(fw_info_t) - sizeof(u32))) == fw_info->hdr_crc);
 }
 
@@ -1169,6 +1179,347 @@ static bool qbt_release_from_part(const char *part_name, bool check_sign)
     return(true);
 }
 
+
+#ifdef QBOOT_USE_FILE
+
+static bool __fw_crc_check(int fd, off_t offset, size_t size, uint32_t crc) {
+  uint32_t fw_crc = 0;
+  static uint8_t crc_buf[4096] = {0};
+  size_t read_size = 0;
+
+  if (lseek(fd, offset, SEEK_SET) < 0) {
+    return false;
+  }
+
+  while (read_size < size) {
+    size_t read_len = size - read_size;
+    if (read_len > sizeof(crc_buf)) {
+      read_len = sizeof(crc_buf);
+    }
+
+    if (read(fd, crc_buf, read_len) != read_len) {
+      return false;
+    }
+
+    fw_crc = crc32_cal(crc_buf, read_len);
+    read_size += read_len;
+  }
+
+  if (fw_crc != crc) {
+    LOG_E("%s crc check failed: 0x%08x != 0x%08x\n", UPDATE_BIN_FILE, fw_crc,
+          crc);
+  }
+
+  return (fw_crc == crc);
+}
+
+static bool __fw_pkg_read(int fd, u32 pos, u8 *buf, u32 read_len, u8 *crypt_buf,
+                          int crypt_type) {
+  lseek(fd, pos, SEEK_SET);
+  switch (crypt_type) {
+  case QBOOT_ALGO_CRYPT_NONE:
+    if (read(fd, buf, read_len) < 0) {
+      return (false);
+    }
+    break;
+
+#ifdef QBOOT_USING_AES
+  case QBOOT_ALGO_CRYPT_AES:
+    if (read(part, pos, crypt_buf, read_len) < 0) {
+      return (false);
+    }
+    qbt_aes_decrypt(buf, crypt_buf, read_len);
+    break;
+#endif
+
+  default:
+    return (false);
+  }
+
+  return (true);
+}
+
+#ifdef QBOOT_USING_APP_CHECK
+static bool __app_crc_check(int fd, const fw_info_t *fw_info) {
+  u32 crc32 = 0xFFFFFFFF;
+  u32 cmprs_len = 0;
+  u32 app_cal_pos = 0;
+  u32 src_read_pos = sizeof(fw_info_t);
+  int crypt_type = (fw_info->algo & QBOOT_ALGO_CRYPT_MASK);
+  int cmprs_type = (fw_info->algo & QBOOT_ALGO_CMPRS_MASK);
+
+  if (!qbt_fw_decrypt_init(crypt_type)) {
+    LOG_E("Qboot app crc check fail. nonsupport encrypt type.");
+    return (false);
+  }
+
+  if (!qbt_fw_decompress_init(cmprs_type)) {
+    LOG_E("Qboot app crc check fail. nonsupport compress type.");
+    return (false);
+  }
+
+  while (app_cal_pos < fw_info->raw_size) {
+    int cal_len = 0;
+    int read_len = sizeof(cmprs_buf);
+    int remain_len = (fw_info->pkg_size + sizeof(fw_info_t) - src_read_pos);
+    if (read_len > remain_len) {
+      read_len = remain_len;
+    }
+    if (!__fw_pkg_read(fd, src_read_pos, cmprs_buf + cmprs_len, read_len,
+                       crypt_buf, crypt_type)) {
+      qbt_fw_decompress_deinit(cmprs_type);
+      LOG_E("Qboot app crc check fail. read package error, fd = %d, addr = "
+            "%08X, length = %d",
+            fd, src_read_pos, read_len);
+      return (false);
+    }
+    src_read_pos += read_len;
+    cmprs_len += read_len;
+
+    remain_len = fw_info->raw_size - app_cal_pos;
+    cal_len = qbt_app_crc_cal(&crc32, remain_len, crypt_buf, cmprs_buf,
+                            &cmprs_len, cmprs_type);
+    if (cal_len < 0) {
+      qbt_fw_decompress_deinit(cmprs_type);
+      LOG_E("Qboot app crc check fail. decompress error.");
+      return (false);
+    }
+    app_cal_pos += cal_len;
+  }
+
+  qbt_fw_decompress_deinit(cmprs_type);
+  crc32 ^= 0xFFFFFFFF;
+  if (crc32 != fw_info->raw_crc) {
+    LOG_E("Qboot app crc check fail. cal.crc: %08X != raw.crc: %08X", crc32,
+          fw_info->raw_crc);
+    return false;
+  }
+
+  return true;
+}
+#endif
+
+static bool __fw_check(int fd, const fw_info_t *fw_info) {
+
+  if (!qbt_fw_info_check(fw_info)) {
+    LOG_E("error fw info check: %d\n", UPDATE_BIN_FILE);
+    return -RT_ERROR;
+  }
+
+#ifdef QBOOT_USING_APP_CHECK
+  if ((fw_info->algo2 & QBOOT_ALGO2_VERIFY_MASK) == QBOOT_ALGO2_VERIFY_CRC) {
+    if (!__fw_crc_check(fd, sizeof(fw_info_t), fw_info->raw_size,
+                        fw_info->raw_crc)) {
+      LOG_E("error fw crc check: %d\n", UPDATE_BIN_FILE);
+      return -RT_ERROR;
+    }
+  }
+#endif
+
+  return true;
+}
+
+static bool __release_sign_check(int fd, const fw_info_t *fw_info) {
+  u32 release_sign = 0;
+
+  u32 pos = (((sizeof(fw_info_t) + fw_info->pkg_size) + 0x1F) & ~0x1F);
+  if (lseek(fd, pos, SEEK_SET) < 0)
+  {
+    return false;
+  }
+  if (read(fd, &release_sign, sizeof(release_sign)) != sizeof(release_sign)) {
+    LOG_E("Qboot read release sign from file%d fail ", fd);
+    return (false);
+  }
+
+  return (release_sign == 0);
+}
+
+static bool __release_sign_write(int fd, const fw_info_t *fw_info) {
+  u32 release_sign = 0;
+
+  u32 pos = (((sizeof(fw_info_t) + fw_info->pkg_size) + 0x1F) & ~0x1F);
+  lseek(fd, pos, SEEK_SET) ;
+  if (write(fd, (u8 *)&release_sign, sizeof(u32)) < 0) {
+    LOG_E("Qboot write release sign to file%d fail.", fd);
+    return (false);
+  }
+
+  return (true);
+}
+
+
+static bool __fw_release(const char *dst_part_name, int fd,
+                         const fw_info_t *fw_info) {
+  u32 cmprs_len = 0;
+  u32 dst_write_pos = 0;
+  u32 src_read_pos = sizeof(fw_info_t);
+  fal_partition_t dst_part = (fal_partition_t)fal_partition_find(dst_part_name);
+
+  if (dst_part == RT_NULL) {
+    LOG_E("Qboot release firmware fail. can't find %s partition.",
+          dst_part_name);
+
+    return (false);
+  }
+
+  int crypt_type = (fw_info->algo & QBOOT_ALGO_CRYPT_MASK);
+  int cmprs_type = (fw_info->algo & QBOOT_ALGO_CMPRS_MASK);
+
+  if (!qbt_fw_decrypt_init(crypt_type)) {
+    LOG_E("Qboot release firmware fail. nonsupport encrypt type.");
+    return (false);
+  }
+
+  if (!qbt_fw_decompress_init(cmprs_type)) {
+    LOG_E("Qboot release firmware fail. nonsupport compress type.");
+    return (false);
+  }
+
+  rt_kprintf("Start erase partition %s ...\n", dst_part_name);
+  if ((fal_partition_erase(dst_part, 0, fw_info->raw_size) < 0) ||
+      (fal_partition_erase(dst_part, dst_part->len - sizeof(fw_info_t),
+                           sizeof(fw_info_t)) < 0)) {
+    qbt_fw_decompress_deinit(cmprs_type);
+    LOG_E("Qboot release firmware fail. erase %s error.", dst_part_name);
+    return (false);
+  }
+
+  rt_kprintf("Start release firmware to %s ...     ", dst_part_name);
+  while (dst_write_pos < fw_info->raw_size) {
+    int write_len = 0;
+    int read_len = QBOOT_BUF_SIZE;
+    int remain_len = (fw_info->pkg_size + sizeof(fw_info_t) - src_read_pos);
+    if (read_len > remain_len) {
+      read_len = remain_len;
+    }
+    if (!__fw_pkg_read(fd, src_read_pos, cmprs_buf + cmprs_len, read_len,
+                       crypt_buf, crypt_type)) {
+      qbt_fw_decompress_deinit(cmprs_type);
+      LOG_E("Qboot release firmware fail. read package error, fd = %d, addr "
+            "= %08X, length = %d",
+            fd, src_read_pos, read_len);
+      return (false);
+    }
+    src_read_pos += read_len;
+    cmprs_len += read_len;
+
+    write_len = qbt_dest_part_write(dst_part, dst_write_pos, crypt_buf, cmprs_buf,
+                                  &cmprs_len, cmprs_type);
+    if (write_len < 0) {
+      qbt_fw_decompress_deinit(cmprs_type);
+      LOG_E("Qboot release firmware fail. write destination error, fd = %d, "
+            "addr = %08X",
+            fd, dst_write_pos);
+      return (false);
+    }
+    dst_write_pos += write_len;
+
+    rt_kprintf("\b\b\b%02d%%", (dst_write_pos * 100 / fw_info->raw_size));
+  }
+  rt_kprintf("\n");
+
+  qbt_fw_decompress_deinit(cmprs_type);
+  if (!qbt_fw_info_write(dst_part_name, fw_info, true)) {
+    LOG_E("Qboot release firmware fail. write firmware to %s fail.",
+          dst_part_name);
+    return (false);
+  }
+
+  return (true);
+}
+
+
+static bool __fw_update(const char *dst_part_name, int fd,
+                        const fw_info_t *fw_info) {
+
+  bool rst;
+
+  if (fal_partition_find(dst_part_name) == RT_NULL) {
+    LOG_E("Qboot firmware update fail. destination partition %s is not exist.",
+          dst_part_name);
+    return (false);
+  }
+
+#ifdef QBOOT_USING_STATUS_LED
+  qled_set_blink(QBOOT_STATUS_LED_PIN, 50, 50);
+#endif
+
+  rst = __fw_release(dst_part_name, fd, fw_info);
+
+#ifdef QBOOT_USING_STATUS_LED
+  qled_set_blink(QBOOT_STATUS_LED_PIN, 50, 450);
+#endif
+
+  if (!rst) {
+    LOG_E("Qboot firmware update fail. firmware release fail.");
+    return (false);
+  }
+
+  if (!qbt_dest_part_verify(dst_part_name)) {
+    LOG_E("Qboot firmware update fail. destination partition verify fail.");
+    return (false);
+  }
+
+  LOG_I("Qboot firmware update success.");
+  return (true);
+}
+
+
+static bool qbt_release_from_file(const char *file_name, bool check_sign) {
+
+  int fd = open(UPDATE_BIN_FILE, O_RDONLY);
+  if (fd < 0) {
+    LOG_E("error open file: %s\n", UPDATE_BIN_FILE);
+    return false;
+  }
+
+  fw_info_t fw_info = {0};
+  if (read(fd, &fw_info, sizeof(fw_info)) != sizeof(fw_info)) {
+    LOG_E("error read file: %s\n", UPDATE_BIN_FILE);
+    close(fd);
+    return false;
+  }
+
+  if (!__fw_check(fd, &fw_info)) {
+    LOG_E("error fw check: %s\n", UPDATE_BIN_FILE);
+    close(fd);
+    return false;
+  }
+
+#ifdef QBOOT_USING_PRODUCT_CODE
+  if (strcmp((char *)fw_info.prod_code, QBOOT_PRODUCT_CODE) != 0) {
+    LOG_E("The product code error.");
+    close(fd);
+    return (false);
+  }
+#endif
+
+  if (check_sign) {
+    if (__release_sign_check(fd, &fw_info)) // don't need release
+    {
+      close(fd);
+      return (true);
+    }
+  }
+
+  if (!__fw_update((char*)fw_info.part_name, fd, &fw_info)) {
+    close(fd);
+    return false;
+  }
+
+  if (check_sign) {
+    if (!__release_sign_check(fd, &fw_info)) {
+      __release_sign_write(fd, &fw_info);
+    }
+  }
+
+  close(fd);
+  return true;
+}
+
+#endif
+
 static void qbt_thread_entry(void *params)
 {
     #define QBOOT_REBOOT_DELAY_MS       5000
@@ -1217,17 +1568,32 @@ static void qbt_thread_entry(void *params)
     }
     #endif
 
+#ifdef QBOOT_USE_FILE
+    qbt_release_from_file(UPDATE_BIN_FILE, true);
+#else 
     qbt_release_from_part(QBOOT_DOWNLOAD_PART_NAME, true);
+#endif
     qbt_jump_to_app();
     
+    /* Try resume if jump failed. */
+#ifdef QBOOT_USE_FILE
+    LOG_I("Try resume application from %s", UPDATE_BIN_FILE);
+    if (qbt_release_from_file(UPDATE_BIN_FILE, false))
+#else 
     LOG_I("Try resume application from %s", QBOOT_DOWNLOAD_PART_NAME);
     if (qbt_app_resume_from(QBOOT_DOWNLOAD_PART_NAME))
+#endif
     {
         qbt_jump_to_app();
     }
 
+#ifdef QBOOT_USE_FILE
+    LOG_I("Try resume application from %s", FACTORY_BIN_FILE);
+    if(qbt_release_from_file(FACTORY_BIN_FILE, false))
+#else 
     LOG_I("Try resume application from %s", QBOOT_FACTORY_PART_NAME);
     if (qbt_app_resume_from(QBOOT_FACTORY_PART_NAME))
+#endif
     {
         qbt_jump_to_app();
     }
