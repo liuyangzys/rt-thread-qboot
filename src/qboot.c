@@ -21,6 +21,8 @@
 #include <qboot_quicklz.h>
 #include <string.h>
 
+#include "rtdebug.h"
+#include "rtdef.h"
 #include "shell.h"
 #include "crc32.h"
 #include "typedef.h"
@@ -84,6 +86,7 @@
 #include "unistd.h"
 #include "fcntl.h"
 #define UPDATE_BIN_FILE "/update/update.rbl"
+#define UPDATE_BIN_FILE_BAK "/update/update_bak.rbl"
 #define FACTORY_BIN_FILE "/update/factory.rbl"
 #endif
 
@@ -1047,7 +1050,7 @@ static bool qbt_shell_init(const char *shell_dev_name)
 
 static bool qbt_shell_key_check(void)
 {
-    char ch;
+    char ch[3] = {0}, c = 0;
     rt_tick_t tick_start = rt_tick_get();
     rt_tick_t tmo = rt_tick_from_millisecond(QBOOT_SHELL_KEY_CHK_TMO * 1000);
 
@@ -1057,9 +1060,14 @@ static bool qbt_shell_key_check(void)
         {
             continue;
         }
-        if (rt_device_read(qbt_shell_dev, -1, &ch, 1) > 0)
+        if (rt_device_read(qbt_shell_dev, -1, &c, 1) > 0)
         {    
-            if (ch == 0x0d)
+            for (int i = 0; i < 2; ++i)
+            {
+                ch[i] = ch[i + 1];
+            }
+            ch[2] = c;
+            if (ch[0] == 'r' && ch[1] == 'e' && ch[2] == 0x0d)
             {
                 return(true);
             }
@@ -1183,34 +1191,41 @@ static bool qbt_release_from_part(const char *part_name, bool check_sign)
 #ifdef QBOOT_USE_FILE
 
 static bool __fw_crc_check(int fd, off_t offset, size_t size, uint32_t crc) {
-  uint32_t fw_crc = 0;
-  static uint8_t crc_buf[4096] = {0};
-  size_t read_size = 0;
+    u32 pos = 0;
+    u32 crc32 = 0xFFFFFFFF;
 
-  if (lseek(fd, offset, SEEK_SET) < 0) {
-    return false;
-  }
+    RT_ASSERT(fd > 0);
 
-  while (read_size < size) {
-    size_t read_len = size - read_size;
-    if (read_len > sizeof(crc_buf)) {
-      read_len = sizeof(crc_buf);
+    lseek(fd, offset, SEEK_SET);
+    
+    while (pos < size)
+    {
+        int read_len = QBOOT_BUF_SIZE;
+        int gzip_remain_len = size - pos;
+        if (read_len > gzip_remain_len)
+        {
+            read_len = gzip_remain_len;
+        }
+        // if (fal_partition_read(part, addr + pos, cmprs_buf, read_len) < 0)
+        ssize_t r_size = read(fd, cmprs_buf, read_len);
+        if (r_size < 0)
+        {
+            LOG_E("Qboot read firmware datas fail. file = %s, addr = %08X, length = %d", UPDATE_BIN_FILE, pos, read_len);
+            return(false);
+        }
+   
+        crc32 = crc32_cyc_cal(crc32, cmprs_buf, r_size);
+        pos += r_size;
+    }
+    crc32 ^= 0xFFFFFFFF;
+
+    if (crc32 != crc)
+    {
+        LOG_E("Qboot verify CRC32 error, cal.crc: %08X != body.crc: %08X", crc32, crc);
+        return(false);
     }
 
-    if (read(fd, crc_buf, read_len) != read_len) {
-      return false;
-    }
-
-    fw_crc = crc32_cal(crc_buf, read_len);
-    read_size += read_len;
-  }
-
-  if (fw_crc != crc) {
-    LOG_E("%s crc check failed: 0x%08x != 0x%08x\n", UPDATE_BIN_FILE, fw_crc,
-          crc);
-  }
-
-  return (fw_crc == crc);
+    return(true);
 }
 
 static bool __fw_pkg_read(int fd, u32 pos, u8 *buf, u32 read_len, u8 *crypt_buf,
@@ -1302,15 +1317,20 @@ static bool __app_crc_check(int fd, const fw_info_t *fw_info) {
 static bool __fw_check(int fd, const fw_info_t *fw_info) {
 
   if (!qbt_fw_info_check(fw_info)) {
-    LOG_E("error fw info check: %d\n", UPDATE_BIN_FILE);
+    LOG_E("error fw info check: %s\n", UPDATE_BIN_FILE);
+    return -RT_ERROR;
+  }
+
+  if (!__fw_crc_check(fd, sizeof(fw_info_t), fw_info->pkg_size,
+                      fw_info->pkg_crc)) {
+    LOG_E("error fw crc check: %s\n", UPDATE_BIN_FILE);
     return -RT_ERROR;
   }
 
 #ifdef QBOOT_USING_APP_CHECK
   if ((fw_info->algo2 & QBOOT_ALGO2_VERIFY_MASK) == QBOOT_ALGO2_VERIFY_CRC) {
-    if (!__fw_crc_check(fd, sizeof(fw_info_t), fw_info->raw_size,
-                        fw_info->raw_crc)) {
-      LOG_E("error fw crc check: %d\n", UPDATE_BIN_FILE);
+    if (!__app_crc_check(fd, fw_info)) {
+      LOG_E("error app crc check: %s\n", UPDATE_BIN_FILE);
       return -RT_ERROR;
     }
   }
@@ -1466,23 +1486,23 @@ static bool __fw_update(const char *dst_part_name, int fd,
 }
 
 
-static bool qbt_release_from_file(const char *file_name, bool check_sign) {
+static bool qbt_release_from_file(const char *file_name) {
 
   int fd = open(UPDATE_BIN_FILE, O_RDONLY);
   if (fd < 0) {
-    LOG_E("error open file: %s\n", UPDATE_BIN_FILE);
+    LOG_I("Qboot firmware update file %s open fail.\n", UPDATE_BIN_FILE);
     return false;
   }
 
   fw_info_t fw_info = {0};
   if (read(fd, &fw_info, sizeof(fw_info)) != sizeof(fw_info)) {
-    LOG_E("error read file: %s\n", UPDATE_BIN_FILE);
+    LOG_E("Qboot firmware update file %s read fail: %s\n", UPDATE_BIN_FILE);
     close(fd);
     return false;
   }
 
   if (!__fw_check(fd, &fw_info)) {
-    LOG_E("error fw check: %s\n", UPDATE_BIN_FILE);
+    LOG_E("Qboot firmware update file %s firmware info check fail. %s\n", UPDATE_BIN_FILE);
     close(fd);
     return false;
   }
@@ -1495,26 +1515,13 @@ static bool qbt_release_from_file(const char *file_name, bool check_sign) {
   }
 #endif
 
-  if (check_sign) {
-    if (__release_sign_check(fd, &fw_info)) // don't need release
-    {
-      close(fd);
-      return (true);
-    }
-  }
-
-  if (!__fw_update((char*)fw_info.part_name, fd, &fw_info)) {
+  if (!__fw_update((char *)fw_info.part_name, fd, &fw_info)) {
     close(fd);
     return false;
   }
 
-  if (check_sign) {
-    if (!__release_sign_check(fd, &fw_info)) {
-      __release_sign_write(fd, &fw_info);
-    }
-  }
-
   close(fd);
+
   return true;
 }
 
@@ -1569,7 +1576,10 @@ static void qbt_thread_entry(void *params)
     #endif
 
 #ifdef QBOOT_USE_FILE
-    qbt_release_from_file(UPDATE_BIN_FILE, true);
+    if (qbt_release_from_file(UPDATE_BIN_FILE))
+    {
+        rename(UPDATE_BIN_FILE, UPDATE_BIN_FILE_BAK);
+    }
 #else 
     qbt_release_from_part(QBOOT_DOWNLOAD_PART_NAME, true);
 #endif
@@ -1577,8 +1587,8 @@ static void qbt_thread_entry(void *params)
     
     /* Try resume if jump failed. */
 #ifdef QBOOT_USE_FILE
-    LOG_I("Try resume application from %s", UPDATE_BIN_FILE);
-    if (qbt_release_from_file(UPDATE_BIN_FILE, false))
+    LOG_I("Try resume application from %s", UPDATE_BIN_FILE_BAK);
+    if (qbt_release_from_file(UPDATE_BIN_FILE_BAK))
 #else 
     LOG_I("Try resume application from %s", QBOOT_DOWNLOAD_PART_NAME);
     if (qbt_app_resume_from(QBOOT_DOWNLOAD_PART_NAME))
@@ -1589,7 +1599,7 @@ static void qbt_thread_entry(void *params)
 
 #ifdef QBOOT_USE_FILE
     LOG_I("Try resume application from %s", FACTORY_BIN_FILE);
-    if(qbt_release_from_file(FACTORY_BIN_FILE, false))
+    if(qbt_release_from_file(FACTORY_BIN_FILE))
 #else 
     LOG_I("Try resume application from %s", QBOOT_FACTORY_PART_NAME);
     if (qbt_app_resume_from(QBOOT_FACTORY_PART_NAME))
