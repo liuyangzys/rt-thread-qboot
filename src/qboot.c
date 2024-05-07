@@ -21,7 +21,7 @@
 #include <qboot_quicklz.h>
 #include <string.h>
 
-#include "rtdebug.h"
+#include "rtdbg.h"
 #include "rtdef.h"
 #include "shell.h"
 #include "crc32.h"
@@ -335,8 +335,8 @@ static int qbt_dest_part_write(fal_partition_t part, u32 pos, u8 *decmprs_buf, u
 {
     int write_len = 0;
     int cmprs_len = 0;
-    int decomp_len = 0;
-    int block_size = 0;
+    // int decomp_len = 0;
+    // int block_size = 0;
     
     cmprs_len = *p_cmprs_len;
     
@@ -489,8 +489,8 @@ static int qbt_app_crc_cal(u32 *p_crc32, u32 max_cal_len, u8 *decmprs_buf, u8 *c
 {
     int write_len = 0;
     int cmprs_len = 0;
-    int decomp_len = 0;
-    int block_size = 0;
+    // int decomp_len = 0;
+    // int block_size = 0;
     
     cmprs_len = *p_cmprs_len;
     
@@ -881,7 +881,7 @@ static bool qbt_fw_update(const char *dst_part_name, const char *src_part_name, 
     return(true);    
 }
 
-RT_WEAK void qbt_jump_to_app(void)
+rt_weak void qbt_jump_to_app(void)
 {
     typedef void (*app_func_t)(void);
     u32 app_addr = QBOOT_APP_ADDR;
@@ -1318,20 +1318,20 @@ static bool __fw_check(int fd, const fw_info_t *fw_info) {
 
   if (!qbt_fw_info_check(fw_info)) {
     LOG_E("error fw info check: %s\n", UPDATE_BIN_FILE);
-    return -RT_ERROR;
+    return false;
   }
 
   if (!__fw_crc_check(fd, sizeof(fw_info_t), fw_info->pkg_size,
                       fw_info->pkg_crc)) {
     LOG_E("error fw crc check: %s\n", UPDATE_BIN_FILE);
-    return -RT_ERROR;
+    return false;
   }
 
 #ifdef QBOOT_USING_APP_CHECK
   if ((fw_info->algo2 & QBOOT_ALGO2_VERIFY_MASK) == QBOOT_ALGO2_VERIFY_CRC) {
     if (!__app_crc_check(fd, fw_info)) {
       LOG_E("error app crc check: %s\n", UPDATE_BIN_FILE);
-      return -RT_ERROR;
+      return false;
     }
   }
 #endif
